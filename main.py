@@ -1,18 +1,35 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import inspect, text
 
 from app.config import settings
 from app.database import engine, Base
 from app.routers import common, operation, dataset, analytics
 
 
+# 旧库缺少批量上报幂等所需的结构时做增量升级（SQLite，幂等）。
+# 仅新增可空列与新表，不破坏既有数据；全新库由 create_all 直接建出完整结构。
+def _ensure_batch_schema(target):
+    inspector = inspect(target)
+    if "operation_data" in inspector.get_table_names():
+        existing_columns = {col["name"] for col in inspector.get_columns("operation_data")}
+        ddl = [
+            ("batch_id", "ALTER TABLE operation_data ADD COLUMN batch_id INTEGER"),
+            ("batch_seq", "ALTER TABLE operation_data ADD COLUMN batch_seq INTEGER"),
+        ]
+        with target.begin() as conn:
+            for column, statement in ddl:
+                if column not in existing_columns:
+                    conn.execute(text(statement))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_operation_data_batch_id "
+                "ON operation_data (batch_id)"
+            ))
+
+
 def create_tables():
-    import os
-    db_path = settings.DATABASE_URL.replace("sqlite:///", "")
-    if not os.path.exists(db_path):
-        Base.metadata.create_all(bind=engine)
-    else:
-        Base.metadata.create_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    _ensure_batch_schema(engine)
 
 
 create_tables()

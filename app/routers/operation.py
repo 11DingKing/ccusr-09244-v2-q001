@@ -7,9 +7,10 @@ from app.database import get_db
 from app.models import OperationData, RobotModel, Scene, Skill, Annotation
 from app.schemas.operation import (
     OperationDataCreate, OperationDataUpdate, OperationDataResponse,
-    OperationDataListResponse, BatchOperationResponse, BatchOperationResultItem,
+    OperationDataListResponse, BatchOperationResponse,
     AnnotationCreate, AnnotationUpdate, AnnotationResponse
 )
+from app.services.batch_operation import BatchRequestError, create_operation_batch
 
 router = APIRouter()
 
@@ -94,70 +95,20 @@ def create_operation_data(data: OperationDataCreate, db: Session = Depends(get_d
 
 @router.post("/operations/batch", response_model=BatchOperationResponse, tags=["作业数据"])
 def create_operation_data_batch(data_list: List[OperationDataCreate], db: Session = Depends(get_db)):
-    total = len(data_list)
-    results: List[BatchOperationResultItem] = []
-    success_count = 0
-    failure_count = 0
-
-    robot_model_ids = {data.robot_model_id for data in data_list}
-    scene_ids = {data.scene_id for data in data_list}
-    skill_ids = {data.skill_id for data in data_list}
-
-    valid_robot_models = {
-        m.id for m in db.query(RobotModel).filter(RobotModel.id.in_(robot_model_ids)).all()
-    }
-    valid_scenes = {
-        s.id for s in db.query(Scene).filter(Scene.id.in_(scene_ids)).all()
-    }
-    valid_skills = {
-        s.id for s in db.query(Skill).filter(Skill.id.in_(skill_ids)).all()
-    }
-
-    for index, data in enumerate(data_list):
-        errors = []
-        if data.robot_model_id not in valid_robot_models:
-            errors.append(f"机型ID {data.robot_model_id} 不存在")
-        if data.scene_id not in valid_scenes:
-            errors.append(f"场景ID {data.scene_id} 不存在")
-        if data.skill_id not in valid_skills:
-            errors.append(f"技能ID {data.skill_id} 不存在")
-
-        if errors:
-            failure_count += 1
-            results.append(BatchOperationResultItem(
-                index=index,
-                success=False,
-                error="; ".join(errors)
-            ))
-            continue
-
-        try:
-            operation = OperationData(**data.model_dump())
-            db.add(operation)
-            db.flush()
-            db.refresh(operation)
-            db.commit()
-            success_count += 1
-            results.append(BatchOperationResultItem(
-                index=index,
-                success=True,
-                data=operation
-            ))
-        except Exception as e:
-            db.rollback()
-            failure_count += 1
-            results.append(BatchOperationResultItem(
-                index=index,
-                success=False,
-                error=str(e)
-            ))
-
-    return BatchOperationResponse(
-        total=total,
-        success_count=success_count,
-        failure_count=failure_count,
-        results=results
-    )
+    # 整批请求在校验、关联资源检查与保存阶段共享同一事务边界：
+    # 任何一条失败都会整体回滚，错误中给出原始输入位置（index，0 基）与原因。
+    # 完全相同的重试由服务层基于请求指纹幂等处理，不重复落库。
+    try:
+        return create_operation_batch(db, data_list)
+    except BatchRequestError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": exc.message,
+                "phase": exc.phase,
+                "errors": exc.errors,
+            },
+        )
 
 
 @router.put("/operations/{operation_id}", response_model=OperationDataResponse, tags=["作业数据"])

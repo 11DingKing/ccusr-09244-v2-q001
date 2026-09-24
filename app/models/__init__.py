@@ -46,6 +46,21 @@ class Skill(Base):
     operations = relationship("OperationData", back_populates="skill")
 
 
+class BatchUpload(Base):
+    """一次批量作业上报。以请求内容指纹做幂等键，保证采集端重试不会重复落库。"""
+
+    __tablename__ = "batch_uploads"
+
+    id = Column(Integer, primary_key=True, index=True)
+    request_fingerprint = Column(String(64), unique=True, nullable=False, index=True)
+    total_items = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    operations = relationship(
+        "OperationData", back_populates="batch", order_by="OperationData.batch_seq"
+    )
+
+
 class OperationData(Base):
     __tablename__ = "operation_data"
 
@@ -54,6 +69,10 @@ class OperationData(Base):
     scene_id = Column(Integer, ForeignKey("scenes.id"), nullable=False, index=True)
     skill_id = Column(Integer, ForeignKey("skills.id"), nullable=False, index=True)
     robot_serial = Column(String(100), nullable=True, index=True)
+
+    # 所属批量上报及在原始请求中的序号（0 基）。单条录入时为空，以保持单条接口既有行为。
+    batch_id = Column(Integer, ForeignKey("batch_uploads.id"), nullable=True, index=True)
+    batch_seq = Column(Integer, nullable=True)
 
     motion_trajectory = Column(JSON, nullable=False)
     perception_records = Column(JSON, nullable=False)
@@ -75,6 +94,7 @@ class OperationData(Base):
     robot_model = relationship("RobotModel", back_populates="operations")
     scene = relationship("Scene", back_populates="operations")
     skill = relationship("Skill", back_populates="operations")
+    batch = relationship("BatchUpload", back_populates="operations")
     annotation = relationship("Annotation", back_populates="operation_data", uselist=False, cascade="all, delete-orphan")
     dataset_items = relationship("DatasetItem", back_populates="operation_data", cascade="all, delete-orphan")
 

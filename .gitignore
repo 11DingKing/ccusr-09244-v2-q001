@@ -14,8 +14,13 @@ data/*.db-journal
 data/*.mv.db
 data/*.trace.db
 venv/
+.venv/
 __pycache__/
 *.pyc
 .mypy_cache/
 vendor/
 .phpunit.result.cache
+
+# 本地默认 SQLite 数据库
+/*.db
+/*.db-journal

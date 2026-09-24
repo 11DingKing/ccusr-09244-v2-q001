@@ -85,6 +85,7 @@ class BatchOperationResponse(BaseModel):
     success_count: int
     failure_count: int
     results: List[BatchOperationResultItem]
+    replayed: bool = Field(False, description="是否为幂等重试命中（True 表示复用首次结果，未重复写入）")
 
 
 class AnnotationBase(BaseModel):
