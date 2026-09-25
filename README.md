@@ -17,6 +17,10 @@
 
 初始化示例数据可执行 `python3 scripts/init_sample_data.py`。该命令会重建本地数据库并写入机型、场景、技能、作业、标注及数据集示例。
 
+## 批量录入语义
+
+`POST /api/v1/operations/batch` 以整批为原子单元：先完成全部记录的校验与关联资源检查，再在单个事务中统一保存；任何一条失败都会整体回滚并返回 400/500，响应中指出问题记录的原始下标与原因，不会留下部分结果。每条记录按内容哈希幂等去重，完全相同的重试（包括服务重启后的重试）会返回已存在的记录而不会重复落库，命中项在结果中以 `deduplicated: true` 标识。`POST /api/v1/operations` 单条录入行为保持不变。
+
 ## 验证
 
 运行 `python3 -m pytest -q` 执行服务和领域工具测试，运行 `python3 -m compileall -q app main.py scripts` 检查编译。测试只使用临时 SQLite 数据库，不需要额外服务。

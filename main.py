@@ -2,17 +2,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.database import engine, Base
+from app.database import engine, Base, ensure_schema_upgrades
 from app.routers import common, operation, dataset, analytics
 
 
 def create_tables():
-    import os
-    db_path = settings.DATABASE_URL.replace("sqlite:///", "")
-    if not os.path.exists(db_path):
-        Base.metadata.create_all(bind=engine)
-    else:
-        Base.metadata.create_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    ensure_schema_upgrades()
 
 
 create_tables()

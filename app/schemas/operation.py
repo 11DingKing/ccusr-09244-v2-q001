@@ -78,6 +78,7 @@ class BatchOperationResultItem(BaseModel):
     success: bool
     data: Optional[OperationDataResponse] = None
     error: Optional[str] = None
+    deduplicated: bool = Field(False, description="是否命中幂等去重（完全相同的记录已存在，未重复写入）")
 
 
 class BatchOperationResponse(BaseModel):

@@ -70,6 +70,9 @@ class OperationData(Base):
     completeness_score = Column(Float, nullable=True)
     data_grade = Column(String(10), nullable=True, index=True)
 
+    # 批量入库幂等键：录入内容的规范化哈希，完全相同的上报不会重复落库
+    content_hash = Column(String(64), nullable=True, unique=True, index=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     robot_model = relationship("RobotModel", back_populates="operations")

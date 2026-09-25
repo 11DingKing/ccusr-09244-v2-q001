@@ -1,5 +1,6 @@
-from typing import List, Optional
+from typing import Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_
 
@@ -10,6 +11,7 @@ from app.schemas.operation import (
     OperationDataListResponse, BatchOperationResponse, BatchOperationResultItem,
     AnnotationCreate, AnnotationUpdate, AnnotationResponse
 )
+from app.services.ingest import compute_content_hash
 
 router = APIRouter()
 
@@ -94,11 +96,17 @@ def create_operation_data(data: OperationDataCreate, db: Session = Depends(get_d
 
 @router.post("/operations/batch", response_model=BatchOperationResponse, tags=["作业数据"])
 def create_operation_data_batch(data_list: List[OperationDataCreate], db: Session = Depends(get_db)):
-    total = len(data_list)
-    results: List[BatchOperationResultItem] = []
-    success_count = 0
-    failure_count = 0
+    """批量录入作业数据。
 
+    整批请求是一个原子单元：先完成全部校验与关联资源检查，再在单个事务中
+    统一保存；任何一条失败都会整体回滚，不留下部分结果。每条记录按内容哈希
+    去重，完全相同的重试（包括服务重启后的重试）不会重复落库。
+    """
+    total = len(data_list)
+    if total == 0:
+        return BatchOperationResponse(total=0, success_count=0, failure_count=0, results=[])
+
+    # 阶段一：逐条校验与关联资源检查，汇总全部错误，此阶段不写库
     robot_model_ids = {data.robot_model_id for data in data_list}
     scene_ids = {data.scene_id for data in data_list}
     skill_ids = {data.skill_id for data in data_list}
@@ -113,6 +121,9 @@ def create_operation_data_batch(data_list: List[OperationDataCreate], db: Sessio
         s.id for s in db.query(Skill).filter(Skill.id.in_(skill_ids)).all()
     }
 
+    content_hashes = [compute_content_hash(data) for data in data_list]
+
+    item_errors: Dict[int, List[str]] = {}
     for index, data in enumerate(data_list):
         errors = []
         if data.robot_model_id not in valid_robot_models:
@@ -121,42 +132,101 @@ def create_operation_data_batch(data_list: List[OperationDataCreate], db: Sessio
             errors.append(f"场景ID {data.scene_id} 不存在")
         if data.skill_id not in valid_skills:
             errors.append(f"技能ID {data.skill_id} 不存在")
-
         if errors:
-            failure_count += 1
-            results.append(BatchOperationResultItem(
-                index=index,
-                success=False,
-                error="; ".join(errors)
-            ))
-            continue
+            item_errors[index] = errors
 
-        try:
-            operation = OperationData(**data.model_dump())
-            db.add(operation)
-            db.flush()
+    first_seen: Dict[str, int] = {}
+    for index, content_hash in enumerate(content_hashes):
+        if content_hash in first_seen:
+            item_errors.setdefault(index, []).append(
+                f"与第 {first_seen[content_hash]} 条记录内容完全重复"
+            )
+        else:
+            first_seen[content_hash] = index
+
+    if item_errors:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "批量数据校验失败，整批未写入任何记录",
+                "item_errors": [
+                    {"index": index, "errors": errors}
+                    for index, errors in sorted(item_errors.items())
+                ],
+            },
+        )
+
+    # 阶段二：幂等检查，完全相同且已入库的记录直接复用，不重复写入
+    existing_by_hash = {
+        op.content_hash: op
+        for op in db.query(OperationData)
+        .filter(OperationData.content_hash.in_(content_hashes))
+        .all()
+    }
+
+    # 阶段三：单个事务统一保存，任何异常都整体回滚
+    results: List[Optional[BatchOperationResultItem]] = [None] * total
+    pending: List[tuple] = []
+    for index, data in enumerate(data_list):
+        content_hash = content_hashes[index]
+        existing = existing_by_hash.get(content_hash)
+        if existing is not None:
+            results[index] = BatchOperationResultItem(
+                index=index, success=True, data=existing, deduplicated=True
+            )
+            continue
+        operation = OperationData(**data.model_dump(), content_hash=content_hash)
+        db.add(operation)
+        pending.append((index, operation))
+
+    try:
+        db.flush()
+        for index, operation in pending:
             db.refresh(operation)
-            db.commit()
-            success_count += 1
-            results.append(BatchOperationResultItem(
-                index=index,
-                success=True,
-                data=operation
-            ))
-        except Exception as e:
-            db.rollback()
-            failure_count += 1
-            results.append(BatchOperationResultItem(
-                index=index,
-                success=False,
-                error=str(e)
-            ))
+            results[index] = BatchOperationResultItem(
+                index=index, success=True, data=operation
+            )
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        # 并发的相同批次可能已抢先提交：若全部内容均已落库则按幂等成功返回
+        replayed = {
+            op.content_hash: op
+            for op in db.query(OperationData)
+            .filter(OperationData.content_hash.in_(content_hashes))
+            .all()
+        }
+        if all(h in replayed for h in content_hashes):
+            return BatchOperationResponse(
+                total=total,
+                success_count=total,
+                failure_count=0,
+                results=[
+                    BatchOperationResultItem(
+                        index=index,
+                        success=True,
+                        data=replayed[content_hashes[index]],
+                        deduplicated=True,
+                    )
+                    for index in range(total)
+                ],
+            )
+        raise HTTPException(
+            status_code=500,
+            detail="批量保存失败：与已有数据冲突，整批已回滚，未留下部分结果",
+        )
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"批量保存失败，整批已回滚，未留下部分结果: {e}",
+        )
 
     return BatchOperationResponse(
         total=total,
-        success_count=success_count,
-        failure_count=failure_count,
-        results=results
+        success_count=total,
+        failure_count=0,
+        results=results,
     )
 
 
